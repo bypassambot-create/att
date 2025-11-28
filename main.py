@@ -7,6 +7,7 @@ and counts (Active / Inactive / Total) shown in the header.
 """
 
 import time
+import os
 import sqlite3
 import threading
 from datetime import datetime, timedelta
@@ -410,3 +411,4 @@ if __name__ == '__main__':
     threading.Timer(SCAN_INTERVAL_SECONDS, scan_and_mark_inactive).start()
     print("Bot polling started...")
     bot.infinity_polling()
+
