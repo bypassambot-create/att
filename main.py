@@ -4,7 +4,10 @@ attendance_bot.py
 
 Telegram group attendance bot using pyTelegramBotAPI (telebot) + SQLite.
 
-Change: do NOT track/list bot accounts (is_bot flag).
+Fixes for sqlite "database is locked":
+- use timeout on connections
+- set PRAGMA journal_mode = WAL and busy_timeout
+- serialize access with a threading.Lock() (db_lock)
 """
 import os
 import sqlite3
@@ -25,6 +28,7 @@ MINUTES_REDUCED_PER_MESSAGE = 1
 MESSAGES_TO_CLEAR_INACTIVE = 15
 SCAN_INTERVAL_SECONDS = 10 * 60
 PAGE_SIZE = 10
+SQLITE_TIMEOUT = 30.0  # seconds to wait for locks
 # ------------------------------------------------
 
 # ---------------- SQLite adapters/converters ----------------
@@ -43,173 +47,193 @@ sqlite3.register_converter("timestamp", convert_datetime)
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode='HTML')
 
-# ---------------- Database helpers ----------------
+# DB lock to serialize access across threads (polling handlers + background scanner)
+db_lock = threading.Lock()
+
 def db_conn():
-    return sqlite3.connect(
+    """
+    Return a new sqlite3 connection with timeout and pragmas set.
+    Always create a fresh connection per call (don't share connections across threads).
+    """
+    conn = sqlite3.connect(
         DB_PATH,
         detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
+        timeout=SQLITE_TIMEOUT,
         check_same_thread=False
     )
+    # Set pragmas to improve concurrency
+    # Note: executing pragmas per connection is fine.
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout = 30000;")  # 30000 ms = 30s
+    return conn
 
+# ---------------- Database helpers ----------------
 def init_db():
-    conn = db_conn()
-    cur = conn.cursor()
-    # Add is_bot INTEGER DEFAULT 0 column to mark bot accounts (0 = human, 1 = bot)
-    cur.execute('''
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        first_name TEXT,
-        last_name TEXT,
-        last_active TIMESTAMP,
-        inactive_until TIMESTAMP,
-        messages_since_inactive INTEGER DEFAULT 0,
-        inactive_marked_at TIMESTAMP,
-        is_bot INTEGER DEFAULT 0
-    )
-    ''')
-    conn.commit()
-    conn.close()
+    with db_lock:
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            last_active TIMESTAMP,
+            inactive_until TIMESTAMP,
+            messages_since_inactive INTEGER DEFAULT 0,
+            inactive_marked_at TIMESTAMP,
+            is_bot INTEGER DEFAULT 0
+        )
+        ''')
+        conn.commit()
+        conn.close()
 
 def upsert_user(user_id, username=None, first_name=None, last_name=None, is_bot=False):
-    # If it's a bot, we won't insert/update it (do nothing)
+    # Skip adding bots entirely
     if is_bot:
         return
     now = datetime.now(timezone.utc)
-    conn = db_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
-    if cur.fetchone():
-        cur.execute("""
-            UPDATE users SET
-                username = COALESCE(?, username),
-                first_name = COALESCE(?, first_name),
-                last_name = COALESCE(?, last_name),
-                is_bot = COALESCE(?, is_bot)
-            WHERE user_id = ?
-        """, (username, first_name, last_name, 0, user_id))
-    else:
-        cur.execute("""
-            INSERT INTO users (user_id, username, first_name, last_name, last_active, is_bot)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (user_id, username, first_name, last_name, now, 0))
-    conn.commit()
-    conn.close()
+    with db_lock:
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+        if cur.fetchone():
+            cur.execute("""
+                UPDATE users SET
+                    username = COALESCE(?, username),
+                    first_name = COALESCE(?, first_name),
+                    last_name = COALESCE(?, last_name),
+                    is_bot = COALESCE(?, is_bot)
+                WHERE user_id = ?
+            """, (username, first_name, last_name, 0, user_id))
+        else:
+            cur.execute("""
+                INSERT INTO users (user_id, username, first_name, last_name, last_active, is_bot)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (user_id, username, first_name, last_name, now, 0))
+        conn.commit()
+        conn.close()
 
 def mark_active(user_id):
     now = datetime.now(timezone.utc)
-    conn = db_conn()
-    cur = conn.cursor()
-    # Only update if user is not a bot (is_bot = 0)
-    cur.execute("""
-        UPDATE users
-        SET last_active = ?,
-            messages_since_inactive = CASE WHEN inactive_until IS NOT NULL AND inactive_until > ? THEN messages_since_inactive ELSE 0 END
-        WHERE user_id = ? AND is_bot = 0
-    """, (now, now, user_id))
-    conn.commit()
-    conn.close()
+    with db_lock:
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE users
+            SET last_active = ?,
+                messages_since_inactive = CASE WHEN inactive_until IS NOT NULL AND inactive_until > ? THEN messages_since_inactive ELSE 0 END
+            WHERE user_id = ? AND is_bot = 0
+        """, (now, now, user_id))
+        conn.commit()
+        conn.close()
 
 def get_user(user_id):
-    conn = db_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT user_id, username, first_name, last_name, last_active, inactive_until, messages_since_inactive, inactive_marked_at, is_bot FROM users WHERE user_id = ?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row
+    # read-only; still use lock to avoid concurrent schema changes
+    with db_lock:
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, username, first_name, last_name, last_active, inactive_until, messages_since_inactive, inactive_marked_at, is_bot FROM users WHERE user_id = ?", (user_id,))
+        row = cur.fetchone()
+        conn.close()
+        return row
 
 def set_inactive(user_id):
     now = datetime.now(timezone.utc)
     until = now + INACTIVE_PERIOD
-    conn = db_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE users SET inactive_until = ?, inactive_marked_at = ?, messages_since_inactive = 0 WHERE user_id = ? AND is_bot = 0
-    """, (until, now, user_id))
-    conn.commit()
-    conn.close()
+    with db_lock:
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE users SET inactive_until = ?, inactive_marked_at = ?, messages_since_inactive = 0 WHERE user_id = ? AND is_bot = 0
+        """, (until, now, user_id))
+        conn.commit()
+        conn.close()
 
 def clear_inactive(user_id):
-    conn = db_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE users SET inactive_until = NULL, messages_since_inactive = 0, inactive_marked_at = NULL WHERE user_id = ? AND is_bot = 0
-    """, (user_id,))
-    conn.commit()
-    conn.close()
+    with db_lock:
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE users SET inactive_until = NULL, messages_since_inactive = 0, inactive_marked_at = NULL WHERE user_id = ? AND is_bot = 0
+        """, (user_id,))
+        conn.commit()
+        conn.close()
 
 def reduce_inactive_by_minutes(user_id, minutes=1):
-    conn = db_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT inactive_until, messages_since_inactive FROM users WHERE user_id = ? AND is_bot = 0", (user_id,))
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        return
-    inactive_until, messages_since_inactive = row
-    if inactive_until is None:
-        conn.close()
-        return
+    with db_lock:
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT inactive_until, messages_since_inactive FROM users WHERE user_id = ? AND is_bot = 0", (user_id,))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            return
+        inactive_until, messages_since_inactive = row
+        if inactive_until is None:
+            conn.close()
+            return
 
-    inactive_dt = inactive_until if isinstance(inactive_until, datetime) else datetime.fromisoformat(inactive_until)
-    new_until = inactive_dt - timedelta(minutes=minutes)
-    messages_since_inactive = (messages_since_inactive or 0) + 1
+        inactive_dt = inactive_until if isinstance(inactive_until, datetime) else datetime.fromisoformat(inactive_until)
+        new_until = inactive_dt - timedelta(minutes=minutes)
+        messages_since_inactive = (messages_since_inactive or 0) + 1
 
-    if messages_since_inactive >= MESSAGES_TO_CLEAR_INACTIVE or new_until <= datetime.now(timezone.utc):
-        cur.execute("UPDATE users SET inactive_until = NULL, messages_since_inactive = 0, inactive_marked_at = NULL WHERE user_id = ? AND is_bot = 0", (user_id,))
-    else:
-        cur.execute("UPDATE users SET inactive_until = ?, messages_since_inactive = ? WHERE user_id = ? AND is_bot = 0", (new_until, messages_since_inactive, user_id))
-    conn.commit()
-    conn.close()
+        if messages_since_inactive >= MESSAGES_TO_CLEAR_INACTIVE or new_until <= datetime.now(timezone.utc):
+            cur.execute("UPDATE users SET inactive_until = NULL, messages_since_inactive = 0, inactive_marked_at = NULL WHERE user_id = ? AND is_bot = 0", (user_id,))
+        else:
+            cur.execute("UPDATE users SET inactive_until = ?, messages_since_inactive = ? WHERE user_id = ? AND is_bot = 0", (new_until, messages_since_inactive, user_id))
+        conn.commit()
+        conn.close()
 
 def all_tracked_users():
-    conn = db_conn()
-    cur = conn.cursor()
-    # Only select non-bot users
-    cur.execute("SELECT user_id, username, first_name, last_name, last_active, inactive_until FROM users WHERE is_bot = 0")
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-# --------------------------------------------------
+    with db_lock:
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, username, first_name, last_name, last_active, inactive_until FROM users WHERE is_bot = 0")
+        rows = cur.fetchall()
+        conn.close()
+        return rows
 
 # ---------------- Background scanner ----------------
 def scan_and_mark_inactive():
     now = datetime.now(timezone.utc)
-    conn = db_conn()
-    cur = conn.cursor()
-    # only check non-bot users
-    cur.execute("SELECT user_id, last_active, inactive_until FROM users WHERE is_bot = 0")
-    rows = cur.fetchall()
-    for user_id, last_active, inactive_until in rows:
-        if last_active is None:
-            continue
-        last_active_dt = last_active if isinstance(last_active, datetime) else datetime.fromisoformat(last_active)
-        if inactive_until:
-            continue
-        if now - last_active_dt >= INACTIVE_THRESHOLD:
-            until = now + INACTIVE_PERIOD
-            cur.execute("UPDATE users SET inactive_until = ?, inactive_marked_at = ?, messages_since_inactive = 0 WHERE user_id = ? AND is_bot = 0", (until, now, user_id))
-    conn.commit()
-    conn.close()
+    with db_lock:
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, last_active, inactive_until FROM users WHERE is_bot = 0")
+        rows = cur.fetchall()
+        for user_id, last_active, inactive_until in rows:
+            if last_active is None:
+                continue
+            last_active_dt = last_active if isinstance(last_active, datetime) else datetime.fromisoformat(last_active)
+            if inactive_until:
+                continue
+            if now - last_active_dt >= INACTIVE_THRESHOLD:
+                until = now + INACTIVE_PERIOD
+                cur.execute("UPDATE users SET inactive_until = ?, inactive_marked_at = ?, messages_since_inactive = 0 WHERE user_id = ? AND is_bot = 0", (until, now, user_id))
+        conn.commit()
+        conn.close()
+    # schedule next run
     threading.Timer(SCAN_INTERVAL_SECONDS, scan_and_mark_inactive).start()
 
 def scan_and_mark_inactive_once():
     now = datetime.now(timezone.utc)
-    conn = db_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT user_id, last_active, inactive_until FROM users WHERE is_bot = 0")
-    rows = cur.fetchall()
-    for user_id, last_active, inactive_until in rows:
-        if last_active is None:
-            continue
-        last_active_dt = last_active if isinstance(last_active, datetime) else datetime.fromisoformat(last_active)
-        if inactive_until:
-            continue
-        if now - last_active_dt >= INACTIVE_THRESHOLD:
-            until = now + INACTIVE_PERIOD
-            cur.execute("UPDATE users SET inactive_until = ?, inactive_marked_at = ?, messages_since_inactive = 0 WHERE user_id = ? AND is_bot = 0", (until, now, user_id))
-    conn.commit()
-    conn.close()
+    with db_lock:
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, last_active, inactive_until FROM users WHERE is_bot = 0")
+        rows = cur.fetchall()
+        for user_id, last_active, inactive_until in rows:
+            if last_active is None:
+                continue
+            last_active_dt = last_active if isinstance(last_active, datetime) else datetime.fromisoformat(last_active)
+            if inactive_until:
+                continue
+            if now - last_active_dt >= INACTIVE_THRESHOLD:
+                until = now + INACTIVE_PERIOD
+                cur.execute("UPDATE users SET inactive_until = ?, inactive_marked_at = ?, messages_since_inactive = 0 WHERE user_id = ? AND is_bot = 0", (until, now, user_id))
+        conn.commit()
+        conn.close()
 
 # ---------------- Utilities for display ----------------
 def format_user_line(row):
@@ -370,7 +394,6 @@ def handle_all_messages(message):
     last_name = getattr(u, 'last_name', None)
     is_bot = bool(getattr(u, 'is_bot', False))
 
-    # Upsert only if not a bot (upsert_user will skip bots)
     upsert_user(user_id, username=username, first_name=first_name, last_name=last_name, is_bot=is_bot)
     if not is_bot:
         mark_active(user_id)
